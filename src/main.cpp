@@ -3,7 +3,7 @@ MQTT NeoPixel Kids
 Written by: Alexander van der Sar
 
 Based on the Build status light for Devops, but now with two buttons for kids to have some fun communicating with each other in
-kind of secret lights language.
+kind of secret lights language. Current version only uses the 'pattern button'.
 
 website: https://www.vdsar.net/build-status-light-for-devops/
 Repository: https://github.com/arvdsar/MQTT_NeoPixel_Status_Multiple_Improved
@@ -19,10 +19,10 @@ on a live circuit...if you must, connect GND first.
 
 
 v0.1 Initial version and equal to MQTT_NeoPixel_status_Multiple_Improved v1.2. Ready to be changed for the kids :-)
-
+v0.3 working version using half of the pixels to receive and the other half for sending. Left button (Pattern) switches the color.
 */
 
-#define VERSIONNUMBER "v0.1 - 06-01-2021"
+#define VERSIONNUMBER "v0.3 - 13-05-2021"
 
 #include <ESP8266WiFi.h>        //https://github.com/esp8266/Arduino
 #include <DNSServer.h>
@@ -41,6 +41,11 @@ v0.1 Initial version and equal to MQTT_NeoPixel_status_Multiple_Improved v1.2. R
   #include <avr/power.h>
 #endif
 
+// Define the button pins. 
+
+const int interruptPinColor = D7; //GPIO 6 (Select Button)
+const int interruptPinPattern = D6; //GPIO 7 (Commit Button)
+
 // -- Initial name of the Thing. Used e.g. as SSID of the own Access Point.
 // -- Keep it under 16 characters to handle MQTT compatiblity (thingName+ChipID = unique mqttClientID)
 const char thingName[] = "NeoPxKids";
@@ -51,11 +56,12 @@ const char wifiInitialApPassword[] = "password";
 #define STRING_LEN 128
 #define NUMBER_LEN 32
 // -- Configuration specific key. The value should be modified if config structure was changed.
-#define CONFIG_VERSION "npx1"
+#define CONFIG_VERSION "npxk3"
 
 // -- When CONFIG_PIN is pulled to ground on startup, the Thing will use the initial
 //      password to buld an AP. (E.g. in case of lost password)
 #define CONFIG_PIN D3
+
 
 // -- Status indicator pin.
 //      First it will light up (kept LOW), on Wifi connection it will blink,
@@ -65,14 +71,18 @@ const char wifiInitialApPassword[] = "password";
 // -- Callback method declarations.
 void wifiConnected();
 void configSaved();
-boolean formValidator();
+bool formValidator(iotwebconf::WebRequestWrapper* webRequestWrapper);
 void handleRoot();
 void showLedOffset();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 void colorWipe(uint32_t c, uint8_t wait);
-void theaterChase(uint32_t c, uint8_t wait);
+void colorWipeIn(uint32_t c, uint8_t wait);
+void colorWipeOut(uint32_t c, uint8_t wait);
 
+void theaterChase(uint32_t c, uint8_t wait);
+void ICACHE_RAM_ATTR ColorISR();
+void ICACHE_RAM_ATTR PatternISR();
 
 DNSServer dnsServer;
 WebServer server(80);
@@ -88,11 +98,11 @@ PubSubClient client(espClient); //MQTT
 char mqttServerValue[STRING_LEN];
 char mqttUserNameValue[STRING_LEN];
 char mqttUserPasswordValue[STRING_LEN];
-char mqttTopicValue[STRING_LEN];
+char mqttTopicSendValue[STRING_LEN];
+char mqttTopicReceiveValue[STRING_LEN];
+
 char ledOffsetValue[NUMBER_LEN];
 char ledBrightnessValue[NUMBER_LEN];
-char singleStatusValue[STRING_LEN];
-
 
 char mqttClientId[STRING_LEN]; //automatically created. not via config!
 
@@ -100,19 +110,17 @@ IotWebConf iotWebConf(thingName, &dnsServer, &server, wifiInitialApPassword, CON
 IotWebConfTextParameter mqttServerParam = IotWebConfTextParameter("MQTT server", "mqttServer", mqttServerValue, STRING_LEN);
 IotWebConfTextParameter mqttUserNameParam = IotWebConfTextParameter("MQTT user", "mqttUser", mqttUserNameValue, STRING_LEN);
 IotWebConfPasswordParameter mqttUserPasswordParam = IotWebConfPasswordParameter("MQTT password", "mqttPass", mqttUserPasswordValue, STRING_LEN);
-IotWebConfTextParameter mqttTopicParam = IotWebConfTextParameter("MQTT Topic", "mqttTopic", mqttTopicValue, STRING_LEN,NULL,"some/thing/#");
+IotWebConfTextParameter mqttTopicSendParam = IotWebConfTextParameter("MQTT Topic Send", "mqttTopicSend", mqttTopicSendValue, STRING_LEN,NULL,"some/thing/#");  
+IotWebConfTextParameter mqttTopicReceiveParam = IotWebConfTextParameter("MQTT Topic Receive", "mqttTopicReceive", mqttTopicReceiveValue, STRING_LEN,NULL,"some/thing/#");
 IotWebConfNumberParameter ledOffsetParam = IotWebConfNumberParameter("Led Offset", "ledOffset", ledOffsetValue, NUMBER_LEN, "0");
-IotWebConfCheckboxParameter singleStatusParam = IotWebConfCheckboxParameter("Single Status", "singleStatus", singleStatusValue, STRING_LEN,  false);
 
 //LedBrightness: 255 is the max brightness. It will draw to much current if you turn on all leds on white color (12 leds x 20 milliAmps x 3 colors (to make white) = 720 mA. Wemos can handle 500 mA)
 //White means all leds Red/Green/Blue on so 3 x 20 mA per pixel. Just to be sure limited the Max setting to 200 instead of 255. No exact science though.
-IotWebConfNumberParameter ledBrightnessParam = IotWebConfNumberParameter("Led Brightness", "ledBrightness", ledBrightnessValue, NUMBER_LEN, "10","5..200", "min='5' max='200' step='5'"); //Limited to 200 (out of 255)
+IotWebConfNumberParameter ledBrightnessParam = IotWebConfNumberParameter("Led Brightness", "ledBrightness", ledBrightnessValue, NUMBER_LEN, "60","5..200", "min='5' max='200' step='5'"); //Limited to 200 (out of 255)
 
 
 #define PIN 4 //Neo pixel data pin (GPIO4 / D2)
 #define NUMBEROFLEDS 12 //the amount of Leds on the strip
-#define blinktime 800 //milliseconds between ON/OFF while blinking
-
 
 // Parameter 1 = number of pixels in strip
 // Parameter 2 = Arduino pin number (most are valid)
@@ -133,10 +141,17 @@ int pixel = 0;      //Indicate which Pixel to light
 int inConfig = 0;  //Indicator if you are on config portal or not (for blocking Led Pattern)
 long lastMsg = 0;   //timestamp of last MQTT Publish
 
-long previous_time = 0;
-long current_time = 0;
-int blink = 0;           //to keep track of blinking status (on or off)
+//long previous_time = 0;
+//long current_time = 0;
 bool needReset = false;
+
+bool patternInterrupt = false;
+bool colorInterrupt = false;
+long patternTime = 0;
+long colorTime = 0;
+
+int updateLedsIn = 1;
+int updateLedsOut = 0;
 
 /*
 Assume NUMBEROFLEDS is 12, so using a 12 pixel led ring (or strip)
@@ -161,14 +176,15 @@ void setup() {
 
 
   iotWebConf.setStatusPin(STATUS_PIN);
-  //iotWebConf.setConfigPin(CONFIG_PIN);
+  iotWebConf.setConfigPin(CONFIG_PIN);
   iotWebConf.addSystemParameter(&mqttServerParam);
   iotWebConf.addSystemParameter(&mqttUserNameParam);
   iotWebConf.addSystemParameter(&mqttUserPasswordParam);
-  iotWebConf.addSystemParameter(&mqttTopicParam);
+  iotWebConf.addSystemParameter(&mqttTopicSendParam);
+  iotWebConf.addSystemParameter(&mqttTopicReceiveParam);
   iotWebConf.addSystemParameter(&ledOffsetParam);
   iotWebConf.addSystemParameter(&ledBrightnessParam);
-  iotWebConf.addSystemParameter(&singleStatusParam);
+ // iotWebConf.addSystemParameter(&singleStatusParam);
   iotWebConf.setConfigSavedCallback(&configSaved);
   iotWebConf.setFormValidator(&formValidator);
   iotWebConf.getApTimeoutParameter()->visible = false; //set to true if you want to specify the timeout in portal
@@ -185,10 +201,10 @@ void setup() {
     mqttServerValue[0] = '\0';
     mqttUserNameValue[0] = '\0';
     mqttUserPasswordValue[0] = '\0';
-    mqttTopicValue[0] ='\0';
+    mqttTopicSendValue[0] ='\0';
+    mqttTopicReceiveValue[0] ='\0';
     ledOffsetValue[0] = '\0';
     ledBrightnessValue[0] = '\0';
-    singleStatusValue[0] = '\0';
   }
   
   //Setup Ledstrip
@@ -217,6 +233,13 @@ void setup() {
   showLedOffset(); //Display real Led 1 and the Led 1 after offset
   delay(5000); // so you have time to check if the green led is at the right spot.
 
+//Select Buttons for Interrupt (select color and select pattern)
+  pinMode(interruptPinColor, INPUT_PULLUP); 
+  attachInterrupt(digitalPinToInterrupt(interruptPinColor), ColorISR, CHANGE); 
+
+  pinMode(interruptPinPattern, INPUT_PULLUP); 
+  attachInterrupt(digitalPinToInterrupt(interruptPinPattern), PatternISR, CHANGE);
+
   //add random string to mqttClientId to make it Unique
    //mqttClientId += String(ESP.getChipId(), HEX); //ChipId seems to be part of Mac Address 
 
@@ -234,9 +257,6 @@ MQTT Callback function
 Determine Topic number and store the payload in ledStateArr (Array)
 */
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  //Serial.print("Message arrived [");
-  //Serial.print(topic);
-  //Serial.print("] ");
 
   int LedId = 0;
 
@@ -252,7 +272,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         LedId = atoi(token); 
         token = strtok(NULL, "/"); //break the while. LedId contains the last token
     } 
-  if(LedId > NUMBEROFLEDS) //Is it an invalid LedId outside the range of leds?
+  if(LedId > NUMBEROFLEDS/2) //Is it an invalid LedId outside the range of leds where half of the leds is for the mqtt receiving topic.
     LedId = 0;             //Send the value to index 0 which is not used (ledStateArr[0] is not used)
 
   //Serial.print("Token: ");
@@ -268,12 +288,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   /*
   Define color codes and with or without blink:
-  green - greenblink (1 / 2)
-  red - redblink (3 / 4)
-  yellow - yellowblink (5 / 6)
-  purple - purpleblink (7 /8)
-  blue - blueblink (9 / 10)
-  orange - orangeblink (11 / 12)
+  green (1)
+  red (2)
+  yellow (3)
+  purple (4)
+  blue (5)
+  white (6)
   off (0)
 
   */
@@ -281,42 +301,26 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if(strcmp((char*)payload,"green") == 0){ 
       ledStateArr[LedId] = 1;
     }
-  else if(strcmp((char*)payload,"greenblink") == 0){ 
-      ledStateArr[LedId] = 2;
-    }
   else if(strcmp((char*)payload,"red") == 0){
-          ledStateArr[LedId] = 3;
-    }
-  else if(strcmp((char*)payload,"redblink") == 0){
-          ledStateArr[LedId] = 4;
+          ledStateArr[LedId] = 2;
     }
   else if(strcmp((char*)payload,"yellow") == 0){
-          ledStateArr[LedId] = 5; 
-  }
-    else if(strcmp((char*)payload,"yellowblink") == 0){
-          ledStateArr[LedId] = 6; 
+          ledStateArr[LedId] = 3; 
   }
   else if(strcmp((char*)payload,"purple") == 0){
-        ledStateArr[LedId] = 7;
-    }
-  else if(strcmp((char*)payload,"purpleblink") == 0){
-        ledStateArr[LedId] = 8;
+        ledStateArr[LedId] = 4;
     }
   else if(strcmp((char*)payload,"blue") == 0){
-          ledStateArr[LedId] = 9;
-          }
-  else if(strcmp((char*)payload,"blueblink") == 0){
-          ledStateArr[LedId] = 10;
+          ledStateArr[LedId] = 5;
           }
   else if(strcmp((char*)payload,"orange") == 0){
-          ledStateArr[LedId] = 11; 
-  }
-    else if(strcmp((char*)payload,"orangeblink") == 0){
-          ledStateArr[LedId] = 12; 
+          ledStateArr[LedId] = 6; 
   }
     else if(strcmp((char*)payload,"off") == 0){
           ledStateArr[LedId] = 0; 
   }
+
+  updateLedsIn = 1;
 }
 //**************** END OF MQTT CALLBACK FUNCTION *********************************
 
@@ -330,8 +334,9 @@ void reconnect() {
     // if (client.connect("ESP8266Client")) {
     if (client.connect(mqttClientId, mqttUserNameValue, mqttUserPasswordValue)) { //mqtt_user, mqtt_pass
       Serial.println("connected");
-      Serial.println(mqttTopicValue);
-      client.subscribe(mqttTopicValue); //subscribe to topic
+      Serial.println(mqttTopicReceiveValue);
+      
+      client.subscribe(mqttTopicReceiveValue); //subscribe to topic
     } 
     else {
       Serial.print("failed, rc=");
@@ -353,142 +358,123 @@ void loop() {
   client.loop(); //make sure MQTT Keeps running (hopefully prevents watchdog from kicking in)
   delay(10);
  
+  //Handle Interrupt button press of pattern button 
+  if((patternInterrupt == true) && (millis() > (patternTime+200U))){ 
+    Serial.println("pattern interrupt");
+    patternInterrupt = false;
+    updateLedsOut = 1;
+    }
+
+  //Handle Interrupt button press of color button
+  if((colorInterrupt == true) && (millis() > (colorTime+200U))){
+  
+    int LedId = (NUMBEROFLEDS/2)+1; //in case of 12 leds, divide by 2 = 6. Add 1 --> LedId = 7. So in the ledStateArr on position 7 we will have the color stored.
+    
+    if(ledStateArr[LedId] < 6) //max 6 colors + off combinations
+      ledStateArr[LedId] = ledStateArr[LedId]+1;
+    else  
+      ledStateArr[LedId] = 0;
+
+    Serial.print("LedStateArr: ");
+    Serial.println(ledStateArr[LedId]);
+    colorInterrupt = false;
+    updateLedsOut = 1;
+  }
  /*
   DRIVE THE LEDS
-  green - greenblink (1 / 2)
-  red - redblink (3 / 4)
-  yellow - yellowblink (5 / 6)
-  purple - purpleblink (7 /8)
-  blue - blueblink (9 / 10)
-  orange - orangeblink (11 / 12)
+  green (1)
+  red (2)
+  yellow (3)
+  purple (4)
+  blue (5)
+  white (6)
   off (0)
   */
- if(singleStatusParam.isChecked() == 0){ //false means we want individual statussus per Led
-  for (int x=1;x<NUMBEROFLEDS+1;x++){ //loop through all leds and set the required color (R,G,B)
-      client.loop(); //make sure MQTT Keeps running (hopefully prevents watchdog from kicking in)
+ 
+ 
 
-        //Handle led_offset
-        pixel = (x-1) + atoi(ledOffsetValue);
-        if(pixel > (NUMBEROFLEDS-1)){
-            pixel = pixel - NUMBEROFLEDS;
-        }
-  
-  //GREEN
-    if(ledStateArr[x] == 1) //GREEN
-      strip.setPixelColor(pixel,strip.Color(0,255, 0)); //led on
-
-    else if(ledStateArr[x] == 2){ //GREEN BLINKING
-        if(blink == 1)
-          strip.setPixelColor(pixel,strip.Color(0 ,255, 0)); //led on
-        else if(blink == 0)
-             strip.setPixelColor(pixel,strip.Color(0,0, 0)); //led off
-        }
-  //RED
-  else if(ledStateArr[x] == 3) //RED
-        strip.setPixelColor(pixel,strip.Color(255,0, 0)); //led on
-  else if(ledStateArr[x] == 4){ //RED BLINKING
-        if(blink == 1)
-          strip.setPixelColor(pixel,strip.Color(255 ,0, 0)); //led on
-        else if(blink == 0)
-             strip.setPixelColor(pixel,strip.Color(0,0, 0)); //led off
-        }
-  //YELLOW     
-  else if(ledStateArr[x] == 5) //YELLOW
-        strip.setPixelColor(pixel,strip.Color(128,128, 0)); //led on
-  else if(ledStateArr[x] == 6){ //YELLOW BLINKING)
-        if(blink == 1)
-          strip.setPixelColor(pixel,strip.Color(128,128, 0)); //led on
-        else if(blink == 0)
-             strip.setPixelColor(pixel,strip.Color(0,0, 0)); //led off
-        }
-//PURPLE
-    else if(ledStateArr[x] == 7) //PURPLE
-        strip.setPixelColor(pixel,strip.Color(128,0, 128)); //led on
-     else if(ledStateArr[x] == 8){ //PURPLE BLINKING)
-        if(blink == 1)
-          strip.setPixelColor(pixel,strip.Color(128,0, 128)); //led on
-        else if(blink == 0)
-             strip.setPixelColor(pixel,strip.Color(0,0, 0)); //led off
-        }
-  //BLUE
-    else if(ledStateArr[x] == 9) //BLUE
-        strip.setPixelColor(pixel,strip.Color(0,0, 255)); //led on
-    else if(ledStateArr[x] == 10){ //BLUE BLINKING)
-        if(blink == 1)
-          strip.setPixelColor(pixel,strip.Color(0,0, 255)); //led on
-        else if(blink == 0)
-             strip.setPixelColor(pixel,strip.Color(0,0, 0)); //led off
-        }
-    //ORANGE
-    else if(ledStateArr[x] == 11) //ORANGE
-        strip.setPixelColor(pixel,strip.Color(255,128, 0)); //led on
-    else if(ledStateArr[x] == 12){ //ORANGE (needs blinking)
-        if(blink == 1)
-          strip.setPixelColor(pixel,strip.Color(255,128, 0)); //led on
-        else if(blink == 0)
-             strip.setPixelColor(pixel,strip.Color(0,0, 0)); //led off
-    }
-    //OFF
-     else if(ledStateArr[x] == 0) //LED OFF
-        strip.setPixelColor(pixel,strip.Color(0,0, 0)); //led off
-
-  } //end for-loop
- } //end of if(singleStatusValue)
-
-if(singleStatusParam.isChecked()){ //true means we want to only show one status in total on all leds
+if(updateLedsIn == 1){ //true means we want to only show one status in total on all leds where all leds are 50% of them.
   int x = 1; 
   if(ledStateArr[x] == 1) //GREEN
-      colorWipe(strip.Color(0, 255, 0), 100); // Green
-  else if(ledStateArr[x] == 2) //GREEN BLINKING)
-      theaterChase(strip.Color(0,255, 0), 120); 
+      colorWipeIn(strip.Color(0, 255, 0), 100); // Green
 
   //Check for 2nd topic
-  else if(ledStateArr[x] == 3) //RED
-    colorWipe(strip.Color(255, 0, 0), 100); // Red
-  else if(ledStateArr[x] == 4) //RED BLINKING)
-      theaterChase(strip.Color(255,0, 0), 120); 
-
+  else if(ledStateArr[x] == 2) //RED
+    colorWipeIn(strip.Color(255, 0, 0), 100); // Red 
     
-  else if(ledStateArr[x] == 5) //YELLOW
-    colorWipe(strip.Color(128, 128, 0), 100); // Red
-  else if(ledStateArr[x] == 6) //YELLOW BLINKING)
-    theaterChase(strip.Color(128,128, 0), 120); 
-
+  else if(ledStateArr[x] == 3) //YELLOW
+    colorWipeIn(strip.Color(128, 128, 0), 100); // Red
   
   //Check for 4nd topic
-  else if(ledStateArr[x] == 7) //PURPLE
-    colorWipe(strip.Color(128, 0, 128), 100); // Purple
-  else if(ledStateArr[x] == 8) //PURPLE BLINKING)
-      theaterChase(strip.Color(128,0, 128), 120); 
+  else if(ledStateArr[x] == 4) //PURPLE
+    colorWipeIn(strip.Color(128, 0, 128), 100); // Purple
 
   //BLUE SINGLE STATUS
-  else if(ledStateArr[x] == 9) //BLUE
-    colorWipe(strip.Color(0, 0, 255), 100); // Blue
-  else if(ledStateArr[x] == 10) //BLUE BLINKING)
-    theaterChase(strip.Color(0,0, 255), 120); // Orange blink
+  else if(ledStateArr[x] == 5) //BLUE
+    colorWipeIn(strip.Color(0, 0, 255), 100); // Blue
 
-  //ORANGE SINGLE STATUS  
-  else if(ledStateArr[x] == 11) //ORANGE
-          colorWipe(strip.Color(255, 128, 0), 100); 
-  else if(ledStateArr[x] == 12) //ORANGE Blink
-          theaterChase(strip.Color(255,128, 0), 120); 
+  //WHITE SINGLE STATUS  
+  else if(ledStateArr[x] == 6) //WHITE
+     colorWipeIn(strip.Color(200, 200, 200), 100); 
+  
+  //OFF
+  else if(ledStateArr[x] == 0) //LED OFF
+      colorWipeIn(strip.Color(0,0,0),0);
 
+  updateLedsIn = 0;
+}
+
+if(updateLedsOut == 1){
+   int x = (NUMBEROFLEDS/2)+1; //in case of 12 pixels, number 7 will contain the status for sending the data.
+
+  //GREEN SINGLE STATUS
+  if(ledStateArr[x] == 1){ //GREEN
+      colorWipeOut(strip.Color(0, 255, 0), 100); // Green
+      client.publish(mqttTopicSendValue, "green"); //publish 'color' message to topic.
+  }
+
+ //RED SINGLE STATUS
+  else if(ledStateArr[x] == 2){ //RED
+    colorWipeOut(strip.Color(255, 0, 0), 100); // Red
+    client.publish(mqttTopicSendValue, "red"); //publish 'color' message to topic.
+}
+  //YELLOW SINGLE STATUS
+  else if(ledStateArr[x] == 3){ //YELLOW
+    colorWipeOut(strip.Color(128, 128, 0), 100); // yellow
+    client.publish(mqttTopicSendValue, "yellow"); //publish 'color' message to topic.
+  }
+
+  //PURPLE SINGLE STATUS
+  else if(ledStateArr[x] == 4){ //PURPLE
+    colorWipeOut(strip.Color(128, 0, 128), 100); // Purple
+    client.publish(mqttTopicSendValue, "purple"); //publish 'color' message to topic.
+  }
+  //BLUE SINGLE STATUS
+  else if(ledStateArr[x] == 5){ //BLUE
+    colorWipeOut(strip.Color(0, 0, 255), 100); // Blue
+    client.publish(mqttTopicSendValue, "blue"); //publish 'color' message to topic.
+  }
+
+  //WHITE SINGLE STATUS  
+  else if(ledStateArr[x] == 6){ //WHITE
+          colorWipeOut(strip.Color(200, 200, 200), 100); 
+          client.publish(mqttTopicSendValue, "orange"); //publish 'color' message to topic.
+  }
+  //OFF
+   else if(ledStateArr[x] == 0){ //LED OFF
+        colorWipeOut(strip.Color(0, 0, 0), 0); 
+        client.publish(mqttTopicSendValue, "off"); //publish 'color' message to topic.
+    }
+  updateLedsOut = 0;
 
 }
+
 //Block updating the LEDs while in Configuration portal (inConfig)
 
 if(inConfig == 0) 
   strip.show(); //set all pixels  
  
- //Handle blinking of leds by switching blink value every x-milliseconds (blinktime)
- current_time = millis();
- if(current_time > previous_time + blinktime){
-    if (blink == 0)
-      blink = 1;
-    else 
-      blink = 0;
-    previous_time = millis(); //set current time
- }
+
    
   if (!client.connected()) {
     reconnect();
@@ -530,7 +516,7 @@ void handleRoot()
 
   String s = F("<!DOCTYPE html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>");
   s += iotWebConf.getHtmlFormatProvider()->getStyle();
-  s += "<title>MQTT NeoPixel Status Light</title></head><body>";
+  s += "<title>MQTT NeoPixel Kids Light</title></head><body>";
   s += "<H1>";
   s += iotWebConf.getThingName();
   s+= "</H1>";
@@ -543,8 +529,11 @@ void handleRoot()
   s += "<div>MQTT Server: ";
   s += mqttServerValue;
   s += "</div>";
-  s += "<div>MQTT Topic: ";
-  s += mqttTopicValue;
+  s += "<div>MQTT Send Topic: ";
+  s += mqttTopicSendValue;
+  s += "</div>";
+  s += "<div>MQTT Receive Topic: ";
+  s += mqttTopicReceiveValue;
   s += "</div>";
   s += "<div>LED Offset: ";
   s += ledOffsetValue;
@@ -552,15 +541,11 @@ void handleRoot()
   s += "<div>LED Brightness: ";
   s += ledBrightnessValue;
   s += "</div>";
-    s += "</div>";
-  s += "<div>SingleStatus: ";
-  s += singleStatusValue;
-  s += "</div>";
   s += "<button type='button' onclick=\"location.href='';\" >Refresh</button>";
   s += "<div>Go to <a href='config'>configure page</a> to change values.</div>";
-  s +="<div><small>MQTT NeoPixel Status Multiple - Version: ";
+  s +="<div><small>MQTT NeoPixel Kids - Version: ";
   s += VERSIONNUMBER;
-  s += " - Get latest version on <a href='https://github.com/arvdsar/MQTT_NeoPixel_Status_Multiple_Improved' target='_blank'>Github</a>.";
+  s += " - Get latest version on <a href='https://github.com/arvdsar/MQTT_NeoPixel_Kids' target='_blank'>Github</a>.";
   s += "</small></div>";
 
   s += "</body></html>\n";
@@ -581,7 +566,7 @@ void configSaved()
   needReset = true; 
 }
 
-boolean formValidator()
+bool formValidator(iotwebconf::WebRequestWrapper* webRequestWrapper)
 {
   Serial.println("Validating form.");
   boolean valid = true;
@@ -618,30 +603,44 @@ void showLedOffset(){
 }
 
 
-//Theatre-style crawling lights.
-void theaterChase(uint32_t c, uint8_t wait) {
-  for (int j=0; j<10; j++) {  //do 10 cycles of chasing
-    for (int q=0; q < 3; q++) {
-      for (uint16_t i=0; i < strip.numPixels(); i=i+3) {
-        strip.setPixelColor(i+q, c);    //turn every third pixel on
-      }
-      strip.show();
+// update pixels (updated color wipe) for incoming messages
+void colorWipeIn(uint32_t c, uint8_t wait) {
 
-      delay(wait);
-
-      for (uint16_t i=0; i < strip.numPixels(); i=i+3) {
-        strip.setPixelColor(i+q, strip.Color(0,0,0));        //turn every third pixel off
-      }
-    }
+  for(uint16_t i=1; i<=NUMBEROFLEDS/2; i++) { 
+         //Handle led_offset
+        pixel = (i-1) + atoi(ledOffsetValue);
+        if(pixel > (NUMBEROFLEDS-1)){
+            pixel = pixel - NUMBEROFLEDS;
+        }
+    strip.setPixelColor(pixel, c);
   }
+  strip.show();
 }
 
+// update pixels (updated color wipe) for outcoming messages
+void colorWipeOut(uint32_t c, uint8_t wait) {
 
-// Fill the dots one after the other with a color
-void colorWipe(uint32_t c, uint8_t wait) {
-  for(uint16_t i=0; i<strip.numPixels(); i++) {
-    strip.setPixelColor(i, c);
-    strip.show();
-    delay(wait);
+  for(uint16_t i=(NUMBEROFLEDS/2)+1; i<=NUMBEROFLEDS; i++) { 
+         //Handle led_offset
+        pixel = (i-1) + atoi(ledOffsetValue);
+        if(pixel > (NUMBEROFLEDS-1)){
+            pixel = pixel - NUMBEROFLEDS;
+        }
+    strip.setPixelColor(pixel, c);
   }
+  strip.show();
+}
+
+void ICACHE_RAM_ATTR ColorISR(){
+//What to do when select button is pushed?
+ // Serial.println("ColorISR");
+  colorInterrupt = true;
+  colorTime = millis();
+}
+
+void ICACHE_RAM_ATTR PatternISR(){
+//To commit the selected state to the other device
+ //Serial.println("PatternISR");
+ patternInterrupt = true;
+ patternTime = millis();
 }
