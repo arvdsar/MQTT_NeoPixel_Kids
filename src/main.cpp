@@ -313,7 +313,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   else if(strcmp((char*)payload,"blue") == 0){
           ledStateArr[LedId] = 5;
           }
-  else if(strcmp((char*)payload,"orange") == 0){
+  else if(strcmp((char*)payload,"white") == 0){
           ledStateArr[LedId] = 6; 
   }
     else if(strcmp((char*)payload,"off") == 0){
@@ -458,7 +458,7 @@ if(updateLedsOut == 1){
   //WHITE SINGLE STATUS  
   else if(ledStateArr[x] == 6){ //WHITE
           colorWipeOut(strip.Color(200, 200, 200), 100); 
-          client.publish(mqttTopicSendValue, "orange"); //publish 'color' message to topic.
+          client.publish(mqttTopicSendValue, "white"); //publish 'color' message to topic.
   }
   //OFF
    else if(ledStateArr[x] == 0){ //LED OFF
