@@ -20,9 +20,12 @@ on a live circuit...if you must, connect GND first.
 
 v0.1 Initial version and equal to MQTT_NeoPixel_status_Multiple_Improved v1.2. Ready to be changed for the kids :-)
 v0.3 working version using half of the pixels to receive and the other half for sending. Left button (Pattern) switches the color.
+v0.4 After a reboot of the device you want to see the status of before the reboot. This is accomplished
+by using node-red to receive and forward the messages to another topic which does retain the status.
+Additionally the send color is also forwared to another topic so at boot it can get this status.
 */
 
-#define VERSIONNUMBER "v0.3 - 13-05-2021"
+#define VERSIONNUMBER "v0.4 - 14-05-2021"
 
 #include <ESP8266WiFi.h>        //https://github.com/esp8266/Arduino
 #include <DNSServer.h>
@@ -150,8 +153,9 @@ bool colorInterrupt = false;
 long patternTime = 0;
 long colorTime = 0;
 
-int updateLedsIn = 1;
-int updateLedsOut = 0;
+bool updateLedsIn = false;
+bool updateLedsOut = false;
+bool bootup = true;
 
 /*
 Assume NUMBEROFLEDS is 12, so using a 12 pixel led ring (or strip)
@@ -272,7 +276,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         LedId = atoi(token); 
         token = strtok(NULL, "/"); //break the while. LedId contains the last token
     } 
-  if(LedId > NUMBEROFLEDS/2) //Is it an invalid LedId outside the range of leds where half of the leds is for the mqtt receiving topic.
+  //check if LedId is within the range of available leds (for incoming messages we use half of the pixels. 
+  //half of the pixels + 1 is the LedId that is used to show the previously send item of the device itself
+  //this is used to restore the display in case of a reboot.
+
+    if(LedId > (NUMBEROFLEDS/2)+1 ) 
     LedId = 0;             //Send the value to index 0 which is not used (ledStateArr[0] is not used)
 
   //Serial.print("Token: ");
@@ -295,7 +303,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   blue (5)
   white (6)
   off (0)
-
+  
   */
   //check for possible topics
   if(strcmp((char*)payload,"green") == 0){ 
@@ -320,7 +328,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
           ledStateArr[LedId] = 0; 
   }
 
-  updateLedsIn = 1;
+  if(LedId == 7 && bootup == true){
+    updateLedsOut = true;
+    bootup = false;
+}
+  else
+    updateLedsIn = true;
 }
 //**************** END OF MQTT CALLBACK FUNCTION *********************************
 
@@ -362,7 +375,7 @@ void loop() {
   if((patternInterrupt == true) && (millis() > (patternTime+200U))){ 
     Serial.println("pattern interrupt");
     patternInterrupt = false;
-    updateLedsOut = 1;
+    updateLedsOut = true;
     }
 
   //Handle Interrupt button press of color button
@@ -378,7 +391,7 @@ void loop() {
     Serial.print("LedStateArr: ");
     Serial.println(ledStateArr[LedId]);
     colorInterrupt = false;
-    updateLedsOut = 1;
+    updateLedsOut = true;
   }
  /*
   DRIVE THE LEDS
@@ -393,7 +406,7 @@ void loop() {
  
  
 
-if(updateLedsIn == 1){ //true means we want to only show one status in total on all leds where all leds are 50% of them.
+if(updateLedsIn == true){ //true means we want to only show one status in total on all leds where all leds are 50% of them.
   int x = 1; 
   if(ledStateArr[x] == 1) //GREEN
       colorWipeIn(strip.Color(0, 255, 0), 100); // Green
@@ -421,10 +434,10 @@ if(updateLedsIn == 1){ //true means we want to only show one status in total on 
   else if(ledStateArr[x] == 0) //LED OFF
       colorWipeIn(strip.Color(0,0,0),0);
 
-  updateLedsIn = 0;
+  updateLedsIn = false;
 }
 
-if(updateLedsOut == 1){
+if(updateLedsOut == true){
    int x = (NUMBEROFLEDS/2)+1; //in case of 12 pixels, number 7 will contain the status for sending the data.
 
   //GREEN SINGLE STATUS
@@ -465,7 +478,7 @@ if(updateLedsOut == 1){
         colorWipeOut(strip.Color(0, 0, 0), 0); 
         client.publish(mqttTopicSendValue, "off"); //publish 'color' message to topic.
     }
-  updateLedsOut = 0;
+  updateLedsOut = false;
 
 }
 
